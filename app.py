@@ -20,11 +20,12 @@ import streamlit as st
 @dataclass
 class Params:
     swing_len: int = 10          # SMT lookback in HTF candles
-    arm_bars: int = 4            # setup window (HTF candles) after the SMT candle
-    conf_mode: str = "FVG or OB"  # "FVG or OB" | "FVG and OB" | "None"
+    arm_bars: int = 3            # setup window (HTF candles) after the SMT candle
+    conf_mode: str = "FVG and OB"  # "FVG or OB" | "FVG and OB" | "None"  (an OB almost always exists, so "or" filters nothing)
     disp_mult: float = 1.0       # CSD displacement body >= disp_mult * ATR(LTF)
     rr: float = 2.0
     atr_buf: float = 0.25        # SL buffer = atr_buf * ATR(HTF)
+    max_risk_atr: float = 1.5    # skip late / chasing entries: risk > max_risk_atr * ATR(HTF)
     trade_leg: str = "strong"    # "strong" | "weak" | "both"
     fee_pct: float = 0.1         # per side, in %
     atr_len: int = 14
@@ -98,7 +99,7 @@ def _conf_ok(mode: str, has_fvg: bool, has_ob: bool) -> bool:
 
 
 # ───────────────────────── single setup builder ─────────────────────────
-def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now):
+def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now, cap_end=None):
     i = htf.index.get_loc(t)
     n = len(htf)
     o, h, l, c = (htf[k].to_numpy() for k in ("open", "high", "low", "close"))
@@ -126,7 +127,9 @@ def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now
             fvgs.append((l[j - 2], h[j], htf.index[j - 2], htf.index[j] + htf_td))
 
     start = t + htf_td                              # SMT candle has closed
-    end = t + (p.arm_bars + 2) * htf_td             # setup window end
+    natural_end = t + (p.arm_bars + 2) * htf_td     # setup window end
+    capped = cap_end is not None and cap_end < natural_end
+    end = cap_end if capped else natural_end        # an opposite SMT cancels the older setup
     times = ltf.index
     s = times.searchsorted(start, side="left")
     e = times.searchsorted(end, side="left")
@@ -138,14 +141,24 @@ def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now
     res = dict(
         pair=pair, leg=leg, direction=direction, smt_time=t, swept_leg=swept, window_end=end,
         ob=ob, fvgs=fvgs, has_ob=ob is not None, has_fvg=False,
-        status="ARMED" if end > now else "EXPIRED",
+        status="ARMED" if end > now else ("CANCELLED" if capped else "EXPIRED"),
         csd_time=pd.NaT, entry=np.nan, sl=np.nan, tp=np.nan,
         outcome="", exit_time=pd.NaT, r_net=np.nan,
     )
 
     sweep = l[i] if direction == 1 else h[i]
+    # LTF candle that made the sweep extreme inside the SMT candle: CSD is measured against the series that made it
+    s0 = times.searchsorted(t, side="left")
+    if s0 < s:
+        seg = lo[s0:s] if direction == 1 else hi[s0:s]
+        sw_idx = s0 + int(np.argmin(seg) if direction == 1 else np.argmax(seg))
+    else:
+        sw_idx = s
     for k in range(s, e):
-        sweep = min(sweep, lo[k]) if direction == 1 else max(sweep, hi[k])
+        if direction == 1 and lo[k] < sweep:
+            sweep, sw_idx = lo[k], k
+        elif direction == -1 and hi[k] > sweep:
+            sweep, sw_idx = hi[k], k
         tk = times[k]
         has_fvg = any(f[3] <= tk for f in fvgs)
         if not _conf_ok(p.conf_mode, has_fvg, ob is not None):
@@ -153,10 +166,11 @@ def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now
         a_l = atr_l[k]
         if np.isnan(a_l) or abs(cl[k] - op[k]) < p.disp_mult * a_l:
             continue
-        if direction == 1:
-            trig = cl[k] > op[k] and not np.isnan(dn_run[k]) and cl[k] > dn_run[k]
-        else:
-            trig = cl[k] < op[k] and not np.isnan(up_run[k]) and cl[k] < up_run[k]
+        # CSD: displacement close beyond the open of the opposite-close series that MADE the sweep extreme
+        level = dn_run[sw_idx] if direction == 1 else up_run[sw_idx]
+        if np.isnan(level):
+            continue
+        trig = (cl[k] > op[k] and cl[k] > level) if direction == 1 else (cl[k] < op[k] and cl[k] < level)
         if not trig:
             continue
 
@@ -165,6 +179,9 @@ def build_setup(pair, leg, direction, t, swept, htf, ltf, p: Params, htf_td, now
         sl = sweep - buf if direction == 1 else sweep + buf
         risk = (entry - sl) if direction == 1 else (sl - entry)
         if risk <= entry * 1e-6:
+            continue
+        ref_atr = atr_h if not np.isnan(atr_h) else a_l
+        if risk > p.max_risk_atr * ref_atr:          # price already ran away from the sweep: do not chase
             continue
         tp = entry + direction * p.rr * risk
         outcome, exit_t, r_gross = _simulate(direction, entry, sl, tp, lo, hi, times, k + 1, p.rr)
@@ -190,13 +207,35 @@ def scan_pair(pair, name_a, name_b, data, p: Params, htf_minutes: int, now):
     htfs = {name_a: ha, name_b: hb}
     ltfs = {name_a: prep_ltf(data[name_a][1], p), name_b: prep_ltf(data[name_b][1], p)}
 
-    setups = []
+    # 1) one SMT = one setup: repeats inside a same-direction window are dropped,
+    #    an opposite SMT closes (cancels) the older setup
+    kept = []
     for t, direction, swept in smt_events(name_a, ha, name_b, hb):
-        other = name_b if swept == name_a else name_a
-        strong, weak = other, swept          # strong = leg that FAILED to sweep
+        if kept and kept[-1]["dir"] == direction and t < kept[-1]["end"]:
+            continue
+        if kept and kept[-1]["dir"] != direction and t + htf_td < kept[-1]["end"]:
+            kept[-1]["cap"] = t + htf_td
+        kept.append(dict(t=t, dir=direction, swept=swept, end=t + (p.arm_bars + 2) * htf_td, cap=None))
+
+    setups = []
+    for ev in kept:
+        other = name_b if ev["swept"] == name_a else name_a
+        strong, weak = other, ev["swept"]    # strong = leg that FAILED to sweep
         legs = {"strong": [strong], "weak": [weak], "both": [strong, weak]}[p.trade_leg]
         for leg in legs:
-            setups.append(build_setup(pair, leg, direction, t, swept, htfs[leg], ltfs[leg], p, htf_td, now))
+            setups.append(build_setup(pair, leg, ev["dir"], ev["t"], ev["swept"], htfs[leg], ltfs[leg],
+                                      p, htf_td, now, cap_end=ev["cap"]))
+
+    # 2) one trade at a time per leg: a signal that fires while an earlier trade is still open is skipped
+    busy = {}
+    for sd in sorted([x for x in setups if x["status"] == "TRIGGERED"], key=lambda x: x["csd_time"]):
+        if sd["leg"] in busy:
+            until = busy[sd["leg"]]
+            if pd.isna(until) or sd["csd_time"] <= until:
+                sd.update(status="SKIPPED", csd_time=pd.NaT, entry=np.nan, sl=np.nan, tp=np.nan, has_fvg=False,
+                          outcome="", exit_time=pd.NaT, r_net=np.nan)
+                continue
+        busy[sd["leg"]] = sd["exit_time"]
     return setups
 
 
@@ -339,7 +378,7 @@ def load_asset(src: str, ident: str, htf: str, ltf: str, ltf_bars: int, swing_le
 # ═══════════════════════════ 3) STREAMLIT UI ═══════════════════════════
 st.set_page_config(page_title="ALGOX SMT Scanner", page_icon="📈", layout="wide")
 
-TF_SETS = {"15m → 1m": ("15m", "1m"), "30m → 3m": ("30m", "3m"), "1h → 5m": ("1h", "5m"), "4h → 15m": ("4h", "15m")}
+TF_SETS = {"1h → 5m": ("1h", "5m"), "4h → 15m": ("4h", "15m")}
 GREEN, RED = "#00c853", "#ff1744"
 
 
@@ -358,14 +397,15 @@ with st.sidebar:
     pair_sel = st.selectbox("Pair (Chart & Backtest tabs)", list(PAIRS))
     st.subheader("Logic")
     swing_len = st.slider("SMT lookback (HTF candles)", 3, 30, 10)
-    arm_bars = st.slider("Setup window after SMT (HTF candles)", 1, 10, 4)
-    conf_mode = st.selectbox("Required confluence", ["FVG or OB", "FVG and OB", "None"])
+    arm_bars = st.slider("Setup window after SMT (HTF candles)", 1, 10, 3)
+    conf_mode = st.selectbox("Required confluence", ["FVG or OB", "FVG and OB", "None"], index=1)
     disp_mult = st.slider("CSD displacement (× ATR)", 0.3, 3.0, 1.0, 0.1)
     trade_leg = st.selectbox("Trade leg", ["strong", "weak", "both"],
                              help="strong = leg that FAILED to sweep (ICT preference). weak = leg that swept.")
     st.subheader("Risk")
     rr = st.slider("Reward : Risk", 0.5, 5.0, 2.0, 0.25)
     atr_buf = st.slider("SL buffer (× HTF ATR)", 0.0, 1.0, 0.25, 0.05)
+    max_risk_atr = st.slider("Max risk (× HTF ATR) – skip late entries", 0.5, 4.0, 1.5, 0.25)
     fee = st.number_input("Fee per side (%)", 0.0, 1.0, 0.10, 0.01)
     st.subheader("Data")
     ltf_bars = st.select_slider("LTF candles to load", [500, 1000, 2000, 3000, 5000], value=2000)
@@ -377,7 +417,7 @@ with st.sidebar:
         st.rerun()
 
 P = Params(swing_len=swing_len, arm_bars=arm_bars, conf_mode=conf_mode, disp_mult=disp_mult,
-           rr=rr, atr_buf=atr_buf, trade_leg=trade_leg, fee_pct=fee)
+           rr=rr, atr_buf=atr_buf, max_risk_atr=max_risk_atr, trade_leg=trade_leg, fee_pct=fee)
 ASSETS = dict(BASE_ASSETS)
 ASSETS["GOLD"] = ("yf", gold_t.strip() or "GC=F")
 ASSETS["SILVER"] = ("yf", silver_t.strip() or "SI=F")
@@ -439,6 +479,9 @@ with tab_scan:
     if all_df.empty:
         st.info("No SMT setups found in the loaded data (or data failed to load).")
     else:
+        cnt = all_df["status"].value_counts().to_dict()
+        st.caption("Setups in loaded data: " + " · ".join(f"{k.lower()} {v}" for k, v in cnt.items())
+                   + f"  |  confluence = {conf_mode}, trade leg = {trade_leg}. Too few signals? try Required confluence = \"FVG or OB\".")
         live = all_df[(all_df["status"] == "ARMED") | ((all_df["status"] == "TRIGGERED") & (all_df["outcome"] == "OPEN"))]
         st.subheader("🔔 Live setups")
         if live.empty:
@@ -478,9 +521,11 @@ with tab_chart:
     else:
         leg_pick = st.radio("Chart leg", [a, b], horizontal=True)
         view_bars = st.slider("Candles shown", 100, 1500, 500, 50)
-        sel_p = Params(**{**P.__dict__, "trade_leg": "both"})
-        setups = [s for s in scan_pair(pair_sel, a, b, data, sel_p, TF_MIN[HTF], pd.Timestamp.now(tz="UTC"))
-                  if s["leg"] == leg_pick]
+        setups = [s for s in scan_pair(pair_sel, a, b, data, P, TF_MIN[HTF], pd.Timestamp.now(tz="UTC"))
+                  if s["leg"] == leg_pick and s["status"] in ("ARMED", "TRIGGERED")]
+        if trade_leg != "both":
+            st.caption(f"Chart shows only the **{trade_leg}**-leg signals of {leg_pick} (cancelled / expired / skipped setups are hidden). "
+                       "Set Trade leg = both in the sidebar to see all.")
         d = data[leg_pick][1].tail(view_bars)
         x = d.index.tz_convert("Asia/Kolkata").tz_localize(None)
         fig = go.Figure(go.Candlestick(x=x, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
@@ -562,11 +607,14 @@ with tab_help:
 **Logic**
 1. **SMT** – on a closed **{HTF}** candle exactly one leg of the pair takes the high/low of the previous *N* candles, the other leg refuses.
 2. **Confluence** – Order Block at the SMT candle and/or FVG on the SMT candle or inside the setup window.
-3. **CSD** – on **{LTF}**, a displacement candle closes beyond the open of the last opposite-close candle series.
-4. **Trade** – SL beyond the sweep extreme (+ATR buffer), TP = RR × risk. Signals use closed candles only (no repaint).
+3. **CSD** – on **{LTF}**, a displacement candle closes beyond the open of the opposite-close candle series that made the sweep extreme (a real change in delivery, not a small pullback).
+4. **Trade** – SL beyond the sweep extreme (+ATR buffer), TP = RR × risk. Entries where the risk is more than *Max risk × HTF ATR* are skipped (price already ran away).
+5. **One setup per SMT** – repeated SMTs inside the same window are ignored, an opposite SMT cancels the older setup, and only one trade per leg is open at a time.
+
+Signals use closed candles only (no repaint).
 
 **Limits**
-- Backtests only cover the loaded candles (e.g. 2000 × 1m ≈ 33 hours). Yahoo 1m data is limited to the last 7 days.
+- Backtests only cover the loaded candles (e.g. 2000 × 5m ≈ 7 days, 2000 × 15m ≈ 21 days).
 - Results are a sanity check, not proof. Forward-test on demo before real or funded-account money.
 - Not financial advice.
 """)
